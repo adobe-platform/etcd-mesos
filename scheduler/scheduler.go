@@ -75,6 +75,7 @@ const (
 type Constraint []string
 type Constraints []Constraint
 
+
 type EtcdScheduler struct {
 	Stats                        Stats
 	Master                       string
@@ -83,13 +84,14 @@ type EtcdScheduler struct {
 	FrameworkName                string
 	ZkConnect                    string
 	ZkChroot                     string
+	ZkAcls                       []zk.ACL
 	ZkServers                    []string
 	singleInstancePerSlave       bool
 	desiredInstanceCount         int
 	healthCheck                  func(map[string]*config.Node) error
 	shutdown                     func()
-	reconciliationInfoFunc       func([]string, string, string) (map[string]string, error)
-	updateReconciliationInfoFunc func(map[string]string, []string, string, string) error
+	reconciliationInfoFunc       func([]string, string, []zk.ACL,string) (map[string]string, error)
+	updateReconciliationInfoFunc func(map[string]string, []string, string,  []zk.ACL,string) error
 	mut                          sync.RWMutex
 	state                        State
 	frameworkID                  *mesos.FrameworkID
@@ -115,7 +117,6 @@ type EtcdScheduler struct {
 	reconciliationInfo           map[string]string
 	constraints                  Constraints
 }
-
 type Stats struct {
 	RunningServers   uint32 `json:"running_servers"`
 	LaunchedServers  uint32 `json:"launched_servers"`
@@ -182,8 +183,16 @@ func NewEtcdScheduler(
 
 // AddRawConstraints -- parses a constraint as they'd be added by Marathon.
 func (s *EtcdScheduler) AddRawConstraints(statements string) error {
+	log.V(3).Infof("AddRawConstraints %v\n",statements)
 	for _, tuple := range strings.Split(statements, ";") {
-		statement := strings.SplitN(tuple, ":", 3)
+		if len(strings.TrimSpace(tuple)) == 0{
+			log.Warning("Skipping empty contraint")
+			continue
+		}
+		statement := strings.SplitN(strings.TrimSpace(tuple), ":", 3)
+		if len(statement) != 3 {
+			log.Warningf("invalid constraint %s",tuple)
+		}
 		switch op := strings.ToUpper(statement[1]); op {
 		case "LIKE", "UNLIKE":
 			if len(statement) != 3 {
@@ -199,6 +208,7 @@ func (s *EtcdScheduler) AddRawConstraints(statements string) error {
 			return fmt.Errorf("Unknown constraint operator %s in %s", op, tuple)
 		}
 	}
+	log.V(3).Infof("AddConstraints: Result: %v",s.constraints)
 	return nil
 }
 
@@ -219,6 +229,7 @@ func (s *EtcdScheduler) Registered(
 			frameworkID,
 			s.ZkServers,
 			s.ZkChroot,
+			s.ZkAcls,
 			s.FrameworkName,
 		)
 		if err != nil && err != zk.ErrNodeExists {
@@ -250,18 +261,20 @@ func (s *EtcdScheduler) Disconnected(scheduler.SchedulerDriver) {
 }
 func (s *EtcdScheduler) MatchesConstraints(driver scheduler.SchedulerDriver, offer *mesos.Offer) bool {
 	if len(s.constraints) == 0 {
+		log.Warningf("WARNING: No other user constraints")
 		return true
 	}
 CONSTRAINT:
 	for _, constraint := range s.constraints {
 		subjectName := constraint[0]
 		op := constraint[1]
+		log.V(3).Infof("MatchesConstraints: considering constraint subjectName: %s op: %s",subjectName,op)
+
 		for _, att := range offer.Attributes {
 			if subjectName == att.GetName() && att.GetText().Value != nil {
-
 				result := strings.Contains(*att.GetText().Value, constraint[2])
+				log.V(3).Infof("MatchesConstraints: subjectMatch %s attribute %s ",subjectName,*att.GetText().Value)
 				if (op == "LIKE"  && result)  || (op == "UNLIKE" && !result) {
-
 					continue CONSTRAINT
 				}
 				break
@@ -446,6 +459,7 @@ func (s *EtcdScheduler) StatusUpdate(
 			s.reconciliationInfo,
 			s.ZkServers,
 			s.ZkChroot,
+			s.ZkAcls,
 			s.FrameworkName,
 		)
 		if err != nil {
@@ -512,7 +526,7 @@ func (s *EtcdScheduler) ExecutorLost(
 func (s *EtcdScheduler) Error(driver scheduler.SchedulerDriver, err string) {
 	log.Infoln("Scheduler received error:", err)
 	if err == "Completed framework attempted to re-register" {
-		rpc.ClearZKState(s.ZkServers, s.ZkChroot, s.FrameworkName)
+		rpc.ClearZKState(s.ZkServers, s.ZkChroot, s.ZkAcls,s.FrameworkName)
 		log.Error(
 			"Removing reference to completed " +
 				"framework in zookeeper and dying.",
@@ -575,6 +589,7 @@ func (s *EtcdScheduler) attemptMasterSync(driver scheduler.SchedulerDriver) {
 		previousReconciliationInfo, err := s.reconciliationInfoFunc(
 			s.ZkServers,
 			s.ZkChroot,
+			s.ZkAcls,
 			s.FrameworkName,
 		)
 		if err == nil {
@@ -617,6 +632,7 @@ func (s *EtcdScheduler) attemptMasterSync(driver scheduler.SchedulerDriver) {
 				}
 			}
 		} else {
+			log.Errorf("attemptMasterSync: %v", err)
 			log.Error(err)
 		}
 		time.Sleep(time.Duration(backoff) * time.Second)
@@ -857,6 +873,7 @@ func (s *EtcdScheduler) shouldLaunch(driver scheduler.SchedulerDriver) bool {
 	_, err = s.reconciliationInfoFunc(
 		s.ZkServers,
 		s.ZkChroot,
+		s.ZkAcls,
 		s.FrameworkName,
 	)
 	if err != nil {
